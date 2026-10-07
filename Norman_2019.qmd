@@ -1,0 +1,2328 @@
+---
+title: "Norman 2019"
+format: html
+editor: visual
+---
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(zellkonverter)
+  library(SingleCellExperiment)
+  library(limma)
+  library(Matrix)
+  library(dplyr)
+  library(purrr)
+  library(tibble)
+  library(ggplot2)
+  library(posterior)
+  library(bridgesampling)
+  library(rstan)
+  library(io)
+})
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r}
+# Load data
+norman <- readH5AD("/Users/zhangrui/Desktop/precmat/Norman_2019.h5ad",
+                   reader = "R", use_hdf5 = TRUE)
+
+# Keep control + single-gene perturbations
+perturb <- as.character(colData(norman)$perturbation_name)
+single <- !grepl("\\+", perturb)
+sce_single <- norman[, perturb == "control" | single]
+
+# Use raw counts
+C <- assay(sce_single, "counts")
+
+# Library size
+lib_size <- Matrix::colSums(C)
+
+# Remove cells with zero library size
+keep_cells <- lib_size > 0
+sce_single <- sce_single[, keep_cells]
+C <- assay(sce_single, "counts")
+lib_size <- Matrix::colSums(C)
+
+ptb_raw <- as.character(colData(sce_single)$perturbation_name)
+
+genes <- rownames(sce_single)
+perts <- setdiff(sort(unique(ptb_raw)), "control")
+
+# Offset for log(counts/lib_size + offset)
+offset <- 1
+
+cat("Number of genes:", length(genes), "\n")
+cat("Number of perturbations:", length(perts), "\n")
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, include = FALSE}
+# Run differential expression analysis via limma for each perturbation
+run_limma_one_perturbation <- function(g) {
+  message("Running limma for perturbation: ", g)
+
+  # Find cells belonging to either the control or the current perturbation
+  idx <- which(ptb_raw %in% c("control", g))
+
+  # Keep only the control and perturbation cells
+  C_sub <- as.matrix(C[, idx, drop = FALSE])
+
+  # Keep only library sizes corresponding to these selected cells
+  lib_sub <- lib_size[idx]
+
+  # Log normalization: divide raw umi by the library size and adding an offset
+  E <- log(sweep(C_sub, 2, lib_sub, "/") + offset)
+
+  # Control is the reference
+  group <- factor(ifelse(ptb_raw[idx] == g, "perturb", "control"),
+                  levels = c("control", "perturb"))
+
+  # Construct design matrix
+  design <- model.matrix(~ group)
+
+  # Fit gene-wise linear model using limma to estimate coefficients
+  fit <- lmFit(E, design)
+
+  # Apply empirical Bayes moderation
+  fit <- eBayes(fit, robust = TRUE)
+
+  # Get BH adjusted p-values (q-value) by retaining all genes without sorting
+  tt <- topTable(fit, coef = "groupperturb", number = Inf,
+                 sort.by = "none", adjust.method = "BH")
+
+  tibble(
+    perturbation = g,
+    gene = rownames(tt),
+    logFC = tt$logFC,
+    B = tt$B,
+    p_value = tt$P.Value,
+    q_value = tt$adj.P.Val
+  )
+}
+
+# all_de <- bind_rows(lapply(perts, run_limma_one_perturbation))
+# saveRDS(all_de, "/Users/zhangrui/norman_limma_all_perturbations.rds")
+all_de <- readRDS("/Users/zhangrui/norman_limma_all_perturbations.rds")
+```
+
+```{r}
+# Convert B to posterior probability of differential expression
+all_de <- all_de %>% mutate(posterior_prob = plogis(B))
+
+# Construct a binary gene regulatory network and calculate degree distribution
+make_edges_and_degrees <- function(all_de, posterior_cutoff, genes, perts,
+                                   remove_self_edges = FALSE) {
+
+  # Keep perturbation -> gene effects with posterior probability above cutoff
+  edge_df <- all_de %>% filter(posterior_prob >= posterior_cutoff)
+
+  # Remove self-regulatory loops
+  if (remove_self_edges) {
+    edge_df <- edge_df %>% filter(gene != perturbation)
+  }
+
+  # Keep valid genes and perturbations
+  edge_df <- edge_df %>% filter(gene %in% genes, perturbation %in% perts)
+
+  # Construct adjacency matrix
+  edge_mat <- sparseMatrix(i = match(edge_df$gene, genes), 
+                           j = match(edge_df$perturbation, perts),
+                           x = rep(TRUE, nrow(edge_df)),
+                           dims = c(length(genes), length(perts)),
+                           dimnames = list(genes, perts))
+
+  # In-degree
+  target_in_degree <- as.integer(Matrix::rowSums(edge_mat != 0))
+
+  # Out-degree
+  perturbation_out_degree <- as.integer(Matrix::colSums(edge_mat != 0))
+
+  # In-degree distribution
+  in_degree_table <- tibble(degree = target_in_degree) %>%
+    count(degree, name = "freq") %>%
+    arrange(degree) %>%
+    mutate(prob = freq / sum(freq))
+
+  # Out-degree distribution
+  out_degree_table <- tibble(degree = perturbation_out_degree) %>%
+    count(degree, name = "freq") %>%
+    arrange(degree) %>%
+    mutate(prob = freq / sum(freq))
+
+  list(
+    posterior_cutoff = posterior_cutoff,
+    edge_df = edge_df,
+    edge_mat = edge_mat,
+    target_in_degree = target_in_degree,
+    perturbation_out_degree = perturbation_out_degree,
+    in_degree_table = in_degree_table,
+    out_degree_table = out_degree_table
+  )
+}
+
+posterior_grid <- c(0.5, 0.9, 0.95)
+
+degree_results <- setNames(
+  lapply(
+    posterior_grid,
+    make_edges_and_degrees,
+    all_de = all_de,
+    genes = genes,
+    perts = perts,
+    remove_self_edges = FALSE
+  ),
+  paste0("Posterior_", posterior_grid)
+)
+
+# Degree Distributions
+degree_dist_all <- bind_rows(lapply(names(degree_results), function(nm) {
+
+  in_tab <- degree_results[[nm]]$in_degree_table %>%
+    mutate(Posterior = nm, degree_type = "In-degree: target gene j")
+
+  out_tab <- degree_results[[nm]]$out_degree_table %>%
+    mutate(Posterior = nm, degree_type = "Out-degree: perturbation gene k")
+
+  bind_rows(in_tab, out_tab)
+}))
+
+# Plotting
+in_degree_raw_all <- bind_rows(lapply(names(degree_results), function(nm) {
+  tibble(degree = degree_results[[nm]]$target_in_degree, Posterior = nm)
+}))
+
+ggplot(in_degree_raw_all, aes(x = degree)) +
+  geom_histogram(binwidth = 1, boundary = -0.5) +
+  facet_wrap(~ Posterior, scales = "free_y") +
+  labs(
+    title = "Norman in-degree distribution",
+    subtitle = "Edges defined by limma empirical Bayes analysis with BH-adjusted p-values",
+    x = "Degree of target gene j",
+    y = "Frequency"
+  ) +
+  theme_classic()
+
+out_degree_raw_all <- bind_rows(lapply(names(degree_results), function(nm) {
+  tibble(degree = degree_results[[nm]]$perturbation_out_degree, Posterior = nm)
+}))
+
+ggplot(out_degree_raw_all, aes(x = degree)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~ Posterior, scales = "free_y") +
+  labs(
+    title = "Norman out-degree distribution",
+    subtitle = "Edges defined by limma empirical Bayes analysis with BH-adjusted p-values",
+    x = "Degree of perturbation gene k",
+    y = "Frequency"
+  ) +
+  theme_classic()
+```
+
+For each FDR cutoff $\tau \in\{0.01, 0.05, 0.15\}$, define the binary perturbation-target edge indicator:
+
+$$
+\delta_{kj} = \mathbf 1\{q_{kj}\le \tau\}
+$$\
+Where:
+
+-   $k = 1,\dots,K$ indexes perturbation regulators.
+
+-   $j = 1,\dots,J$ indexes target genes.
+
+-   $q_{kj}$ is the BH-adjusted p-value from the limma empirical Bayes analysis.
+
+-   $\delta_{kj}=1$ means perturbation $k$ significantly affects target gene $j$, and $\delta_{kj}=0$ otherwise.
+
+Define target in-degree and perturbation out-degree as
+
+$$
+c_j=\sum_{k=1}^{K}\delta_{kj}, \qquad j=1,\dots,J,
+$$
+
+$$
+d_k=\sum_{j=1}^{J}\delta_{kj}, \qquad k=1,\dots,K.
+$$
+
+Define in-degree vector for target $j$ and out-degree vector for perturbation $k$ as
+
+$$
+\boldsymbol{\delta}_{·j} = (\delta_{1j}, \delta_{2j}, \ldots, \delta_{Kj}), \qquad \boldsymbol{\delta}_{k·} = (\delta_{k1}, \delta_{k2}, \ldots, \delta_{kJ}).
+$$
+
+Define full perturbation-target edge matrix as
+
+$$
+\mathbf D=(\delta_{kj})_{K\times J}.
+$$
+
+## **1. Bayesian Selection Framework**
+
+For each candidate model $M$, the posterior model probability is calculated using Bayes' theorem:
+
+$$
+p(M\mid \mathbf D) = \frac{p(\mathbf D\mid M)p(M)}{p(\mathbf D)}
+$$
+
+where
+
+$$
+p(\mathbf D)={\sum_{M}p(\mathbf D\mid M)p(M)}.
+$$
+
+Here, $\mathbf D$ is the data used by model $M$. The marginal likelihood for model $M$ is
+
+$$
+p(\mathbf D\mid M) = \int_\theta p(\mathbf D\mid \theta,M)p(\theta\mid M)d\theta.
+$$
+
+After obtaining the model evidence estimate for each candidate model, we combine all model evidence estimates using Bayes' theorem.
+
+## **2. Marginal Models**
+
+The candidate models are:
+
+-   $M_\text{BB}$: Beta-Binomial model
+
+-   Geometric model
+
+    -   $M_\text{GU}$: Untruncated geometric model
+
+    -   $M_\text{GT}$: Truncated geometric model
+
+-   $M_\text{SZ}$: Shifted Zipf model
+
+### **2.1** $M_\text{BB}$: **Beta-Binomial Model**
+
+#### **2.1.1 Target degree** $c_j$
+
+$$
+c_j \mid \phi_j, M_{\text{BB,in}} \sim \operatorname{Binomial}(K, \phi_j), \quad \phi_j \mid M_{\text{BB,in}}\sim \text{Beta}(\alpha,\beta).
+$$
+
+**Model evidence:**
+
+Equivalently,
+
+$$
+\delta_{kj}\mid \phi_j, M_{\text{BB,in}}\sim \operatorname{Bernoulli}(\phi_j),
+$$
+
+so
+
+$$
+p(\delta_{kj}\mid \phi_j, M_{\text{BB,in}}) = \phi_j^{\delta_{kj}} (1-\phi_j)^{1-\delta_{kj}}.
+$$
+
+Define $\boldsymbol{\phi} = (\phi_1,\ldots,\phi_J)$ and condition on $\boldsymbol{\phi}$, the likelihood of the edge matrix $\mathbf D=(\delta_{kj})_{K\times J}$ is
+
+$$
+p(\mathbf D\mid\boldsymbol{\phi},M_{\text{BB,in}}) = \prod_{j=1}^{J} \prod_{k=1}^{K} \phi_j^{\delta_{kj}} (1-\phi_j)^{1-\delta_{kj}}
+$$
+
+$$
+= \prod_{j=1}^{J} \phi_j^{c_j} (1-\phi_j)^{K-c_j}.
+$$
+
+Integrating out $\boldsymbol{\phi}$,
+
+$$
+p(\mathbf D \mid M_{\text{BB,in}}) = \int_{[0,1]^J} p(\mathbf{D} \mid \boldsymbol{\phi},M_{\text{BB,in}}) p(\boldsymbol{\phi} \mid M_{\text{BB,in}}) \, d\boldsymbol{\phi}
+$$
+
+$$
+= \prod_{j=1}^{J} \frac{1}{B(\alpha,\beta)} \int_0^1 \phi_j^{c_j} (1-\phi_j)^{K-c_j} \phi_j^{\alpha-1} (1-\phi_j)^{\beta-1}  \,d\phi_j
+$$
+
+$$
+= \prod_{j=1}^{J} \frac{1}{B(\alpha,\beta)} \int_0^1 \phi_j^{\alpha+c_j-1} (1-\phi_j)^{\beta+K-c_j-1} \,d\phi_j
+$$
+
+$$
+= \prod_{j=1}^{J} \frac{ B(\alpha+c_j,\beta+K-c_j) }{ B(\alpha,\beta) } .
+$$
+
+**Posterior predictive:**
+
+Using Bayes' theorem,
+
+$$
+p(\boldsymbol{\phi}\mid\mathbf D,M_{\text{BB,in}}) = \frac{p(\mathbf D\mid\boldsymbol{\phi },M_{\text{BB,in}})p(\boldsymbol{\phi }\mid M_{\text{BB,in}})} {p(\mathbf D \mid M_{\text{BB,in}})}
+$$
+
+$$
+= \frac{\prod_{j=1}^{J} \frac{1}{B(\alpha,\beta)} \phi_j^{\alpha+c_j-1} (1-\phi_j)^{\beta+K-c_j-1}}{\prod_{j=1}^{J} \frac{B(\alpha+c_j,\beta+K-c_j)}{B(\alpha,\beta)}}
+$$
+
+$$
+= \prod_{j=1}^{J} \frac{\phi_j^{\alpha+c_j-1} (1-\phi_j)^{\beta+K-c_j-1}}{B(\alpha+c_j,\beta+K-c_j)}
+$$
+
+$$
+ = \prod_{j=1}^{J} \operatorname{Beta} \left(\phi_j \mid \alpha+c_j, \beta+K-c_j \right).
+$$
+
+For a new edge $\tilde{\delta}_{kj}$,
+
+$$
+p(\tilde{\delta}_{kj}\mid \mathbf D,M_{\text{BB,in}}) = \int p(\tilde{\delta}_{kj}\mid\boldsymbol{\phi},M_{\text{BB,in}}) p(\boldsymbol{\phi}\mid\mathbf D,M_{\text{BB,in}}) \,d\boldsymbol{\phi}
+$$
+
+$$
+= \frac{1} {B(\alpha+c_j,\beta+K-c_j)} \int_0^1 \phi_j^{\tilde{\delta}_{kj}} (1-\phi_j)^{1-\tilde{\delta}_{kj}} \phi_j^{\alpha+c_j-1} (1-\phi_j)^{\beta+K-c_j-1} \,d\phi_j
+$$
+
+$$
+= \frac{1}{B(\alpha+c_j, \beta+K-c_j)} \int_0^1 \phi_j^{\alpha+c_j+\tilde{\delta}_{kj}-1} (1-\phi_j)^{\beta+K-c_j+1-\tilde{\delta}_{kj}-1} \, d\phi_j
+$$
+
+$$
+= \frac{ B( \alpha+c_j+\tilde{\delta}_{kj}, \beta+K-c_j+1-\tilde{\delta}_{kj} ) }{ B(\alpha+c_j,\beta+K-c_j) }.
+$$
+
+When $\tilde{\delta}_{kj}=1$,
+
+$$
+p(\tilde{\delta}_{kj}=1\mid\mathbf D,M_{\text{BB,in}}) = \frac{ B(\alpha+c_j+1,\beta+K-c_j) }{ B(\alpha+c_j,\beta+K-c_j) }
+$$
+
+$$
+ = \frac{\alpha+c_j} {\alpha+\beta+K} .
+$$
+
+#### **2.1.2 Perturbation degree** $d_k$
+
+$$
+d_k\mid \psi_k, M_{\text{BB,out}}\sim\operatorname{Binomial}(J,\psi_k), \qquad \psi_k \mid M_{\text{BB,out}}\sim\operatorname{Beta}(\alpha,\beta).
+$$
+
+**Model evidence:**
+
+Equivalently,
+
+$$
+\delta_{kj}\mid\psi_k,M_{\text{BB,out}} \sim \operatorname{Bernoulli}(\psi_k).
+$$
+
+Following the same derivation as for the in-degree model,
+
+$$
+p(\mathbf D \mid M_{\text{BB,out}}) = \prod_{k=1}^{K} \frac{ B(\alpha+d_k,\beta+J-d_k) }{ B(\alpha,\beta) } .
+$$
+
+**Posterior predictive:**
+
+For a new edge $\tilde{\delta}_{kj}$,
+
+$$
+p(\tilde{\delta}_{kj}=1\mid\mathbf D, M_{\text{BB,out}}) = \frac{\alpha+d_k} {\alpha+\beta+J} .
+$$
+
+### **2.2** **Geometric Model**
+
+#### **2.2.1** $M_\text{GU}$: **Untruncated Geometric**
+
+**2.2.1.1 Target degree** $c_j$
+
+$$
+c_j \mid \lambda, M_{\text{GU,in}}\sim\operatorname{Geometric}(\lambda), \qquad \lambda \mid M_{\text{GU,in}}\sim\operatorname{Beta}(\alpha,\beta),
+$$
+
+**Model evidence:**
+
+$$
+p(c_j\mid\lambda,M_{\text{GU,in}}) = (1-\lambda)^{c_j}\lambda, \qquad c_j=0,1,2,\ldots.
+$$
+
+We define the incoming edge vector for target gene $j$ as $\boldsymbol{\delta}_{\cdot j} = (\delta_{1j},\ldots,\delta_{Kj})$. Assume that the edge configurations with the same in-degree $c_j$ are exchangeable. Since there are $\binom{K}{c_j}$ possible edge configurations with exactly $c_j$ edges,
+
+$$
+p(\boldsymbol{\delta}_{\cdot j}\mid c_j,M_{\text{GU,in}}) = {\binom{K}{c_j}}^{-1}.
+$$
+
+Since $c_j$ is a deterministic function of $\boldsymbol{\delta}_{\cdot j}$,
+
+$$
+p(\boldsymbol{\delta}_{\cdot j}\mid\lambda,M_{\text{GU,in}}) = p(\boldsymbol{\delta}_{\cdot j},c_j\mid\lambda,M_{\text{GU,in}})
+$$
+
+$$
+= p(\boldsymbol{\delta}_{\cdot j}\mid c_j,M_{\text{GU,in}}) p(c_j\mid\lambda,M_{\text{GU,in}})
+$$
+
+$$
+= \binom{K}{c_j}^{-1} (1-\lambda)^{c_j}\lambda.
+$$
+
+Conditional on $\lambda$, the likelihood of the edge matrix $\mathbf D=(\delta_{kj})_{K\times J}$ is
+
+$$p(\mathbf D\mid\lambda,M_{\text{GU,in}}) = \prod_{j=1}^{J} p(\boldsymbol{\delta}_{\cdot j}\mid\lambda,M_{\text{GU,in}})$$
+
+$$
+= \prod_{j=1}^{J} \binom{K}{c_j}^{-1} (1-\lambda)^{c_j}\lambda.
+$$
+
+Let $S = \sum_{k=1}^{K}\sum_{j=1}^{J}\delta_{kj} = \sum_{j=1}^{J}c_j$ represent the total number of edges, then
+
+$$
+p(\mathbf D\mid\lambda,M_{\text{GU,in}}) = \left[ \prod_{j=1}^{J} \binom{K}{c_j} \right]^{-1}(1-\lambda)^S \lambda^J .
+$$
+
+Integrating out $\lambda$,
+
+$$
+p(\mathbf D \mid M_{\text{GU,in}}) = \int_0^1 p(\mathbf D\mid\lambda,M_{\text{GU,in}})p(\lambda \mid M_{\text{GU,in}}) \,d\lambda
+$$
+
+$$
+= \int_0^1  \left[ \prod_{j=1}^{J} \binom{K}{c_j} \right]^{-1} (1-\lambda)^S \lambda^J \frac{\lambda^{\alpha-1} (1-\lambda)^{\beta-1}}{B(\alpha,\beta)}  \,d\lambda
+$$
+
+$$
+= \left[ \prod_{j=1}^{J} \binom{K}{c_j} \right]^{-1} \frac{1}{B(\alpha,\beta)} \int_0^1  (1-\lambda)^S \lambda^J\lambda^{\alpha-1} (1-\lambda)^{\beta-1} \,d\lambda
+$$
+
+$$
+= \left[ \prod_{j=1}^{J} \binom{K}{c_j} \right]^{-1} \frac{1}{B(\alpha,\beta)} \int_0^1 \lambda^{\alpha+J-1} (1-\lambda)^{\beta+S-1} \,d\lambda
+$$
+
+$$
+= \left[ \prod_{j=1}^{J} \binom{K}{c_j} \right]^{-1} \frac{ B(\alpha+J,\beta+S) }{ B(\alpha,\beta) } .
+$$
+
+**Posterior predictive:**
+
+Using Bayes' theorem,
+
+$$
+p(\lambda\mid\mathbf D,M_{\text{GU,in}}) = \frac{ p(\mathbf D\mid\lambda,M_{\text{GU,in}})p(\lambda \mid M_{\text{GU,in}}) }{ p(\mathbf D \mid M_{\text{GU,in}}) }
+$$
+
+$$
+=\frac{\left[ \prod_{j=1}^{J} \binom{K}{c_j} \right]^{-1}(1-\lambda)^S \lambda^J \frac{\lambda^{\alpha-1} (1-\lambda)^{\beta-1}}{B(\alpha,\beta)}}{\left[ \prod_{j=1}^{J} \binom{K}{c_j} \right]^{-1} \frac{ B(\alpha+J,\beta+S) }{ B(\alpha,\beta) }}
+$$
+
+$$
+= \frac{ \lambda^{\alpha+J-1} (1-\lambda)^{\beta+S-1} }{ B(\alpha+J,\beta+S) }
+$$
+
+$$
+=\operatorname{Beta} (\alpha+J,\beta+S) .
+$$
+
+For a new edge $\tilde{\delta}_{kj}$, since all edge configurations with the same $\tilde c_j$ are exchangeable,
+
+$$
+p(\tilde{\delta}_{kj}=1\mid\tilde c_j,M_{\text{GU,in}}) = \frac{\tilde c_j}{K}.
+$$
+
+Therefore, since $\tilde{c}_j$ is discrete,
+
+$$
+p(\tilde{\delta}_{kj}=1\mid\lambda,M_{\text{GU,in}}) = \sum_{\tilde{c}_j=0}^{\infty} p(\tilde{\delta}_{kj}=1\mid\tilde{c}_j,M_{\text{GU,in}}) p(\tilde{c}_j\mid\lambda,M_{\text{GU,in}})
+$$
+
+$$
+= \frac{1}{K} E[\tilde c_j\mid\lambda]
+$$
+
+$$
+= \frac{1}{K} \frac{1-\lambda}{\lambda}.
+$$
+
+Integrating over the posterior distribution of $\lambda$,
+
+$$
+p(\tilde{\delta}_{kj}=1\mid\mathbf D,M_{\text{GU,in}}) = \int_0^1 p(\tilde{\delta}_{kj}=1\mid\lambda,M_{\text{GU,in}}) p(\lambda\mid\mathbf D,M_{\text{GU,in}}) \,d\lambda
+$$
+
+$$
+= \frac{1}{K} \frac{1} {B(\alpha+J,\beta+S)} \int_0^1 \frac{1-\lambda}{\lambda} \lambda^{\alpha+J-1} (1-\lambda)^{\beta+S-1} \,d\lambda
+$$
+
+$$
+= \frac{1}{K} \frac{1} {B(\alpha+J,\beta+S)} \int_0^1 \lambda^{\alpha+J-2} (1-\lambda)^{\beta+S} \,d\lambda
+$$
+
+$$
+= \frac{1}{K} \frac{ B(\alpha+J-1,\beta+S+1) }{ B(\alpha+J,\beta+S) }
+$$
+
+$$
+= \frac{\beta+S} {K(\alpha+J-1)}.
+$$
+
+**2.2.1.2 Perturbation degree** $d_k$
+
+$$
+d_k \mid  \lambda, M_{\text{GU,out}}\sim\operatorname{Geometric}(\lambda), \qquad \lambda \mid M_{\text{GU,out}}\sim\operatorname{Beta}(\alpha,\beta).
+$$
+
+**Model evidence:**
+
+Following the same derivation as for the target in-degree model,
+
+$$
+p(\mathbf D\mid\lambda,M_{\text{GU,out}}) = \left[ \prod_{k=1}^{K} \binom{J}{d_k} \right]^{-1} (1-\lambda)^S \lambda^K.
+$$
+
+Integrating out $\lambda$,
+
+$$
+p(\mathbf D \mid M_{\text{GU,out}}) = \left[ \prod_{k=1}^{K} \binom{J}{d_k} \right]^{-1} \frac{ B(\alpha+K,\beta+S) }{ B(\alpha,\beta) } .
+$$
+
+**Posterior predictive:**
+
+$$
+p(\lambda\mid\mathbf D,M_{\text{GU,out}}) =\operatorname{Beta} (\alpha+K,\beta+S)
+$$
+
+For a new edge $\tilde{\delta}_{kj}$,
+
+$$
+p(\tilde{\delta}_{kj}=1\mid\lambda,M_{\text{GU,out}}) = \frac{1}{J} E[\tilde d_k\mid\lambda] = \frac{1}{J} \frac{1-\lambda}{\lambda}.
+$$
+
+Integrating over the posterior distribution of $\lambda$,
+
+$$
+p(\tilde{\delta}_{kj}=1\mid\mathbf D,M_{\text{GU,out}}) = \frac{\beta+S} {J(\alpha+K-1)} .
+$$
+
+#### **2.2.2** $M_\text{GT}$: **Truncated Geometric**
+
+**2.2.2.1 Target degree** $c_j$
+
+Since $c_j\in\{0,1,\dots,K\}$, we use a truncated geometric distribution on $\{0,\dots,K\}$. The ordinary zero-supported geometric distribution is
+
+$$
+p(c_j=k\mid\lambda,M_{\text{GT,in}}) = \lambda(1-\lambda)^k, \qquad k=0,1,2,\dots,
+$$
+
+$$
+\lambda \mid M_{\text{GT,in}} \sim \operatorname{Beta}(\alpha, \beta).
+$$
+
+However, in this problem the degree cannot exceed $K$. Therefore, we condition the ordinary geometric distribution on $c_j\le K$:
+
+$$
+p(c_j=k \mid c_j \le K, \lambda,M_{\text{GT,in}}) = \frac{\lambda(1-\lambda)^k}{\sum_{\ell=0}^{K} \lambda(1-\lambda)^\ell}
+$$
+
+$$
+= \frac{(1-\lambda)^k}{\sum_{\ell=0}^{K}(1-\lambda)^\ell}.
+$$
+
+Thus,
+
+$$
+p(c_j=k\mid\lambda, M_{\text{GT,in}}) = \frac{(1-\lambda)^k}{\sum_{\ell=0}^{K} (1-\lambda)^\ell} \qquad k=0,\dots,K,
+$$
+
+As in the untruncated geometric model, assume that all edge configurations with the same in-degree $c_j$ are exchangeable. Then,
+
+$$
+p(\boldsymbol{\delta}_{\cdot j}\mid c_j,M_{\text{GT,in}}) = \binom{K}{c_j}^{-1}.
+$$
+
+Because $c_j$ is a deterministic function of $\boldsymbol{\delta}_{\cdot j}$,
+
+$$
+p(\boldsymbol{\delta}_{\cdot j}\mid\lambda,M_{\text{GT,in}}) = p(\boldsymbol{\delta}_{\cdot j}\mid c_j,M_{\text{GT,in}}) p(c_j\mid\lambda,M_{\text{GT,in}})
+$$
+
+$$
+= \binom{K}{c_j}^{-1} \frac{(1-\lambda)^{c_j}}{\sum_{\ell=0}^{K}(1-\lambda)^\ell}.
+$$
+
+Assuming target genes are conditionally independent given $\lambda$, the likelihood of the edge matrix is
+
+$$
+p(\mathbf D\mid\lambda,M_{\text{GT,in}}) = \prod_{j=1}^{J} p(\boldsymbol{\delta}_{\cdot j}\mid\lambda,M_{\text{GT,in}})
+$$
+
+$$
+= \prod_{j=1}^{J} \left[ \binom{K}{c_j}^{-1} \frac{(1-\lambda)^{c_j}}{\sum_{\ell=0}^{K}(1-\lambda)^\ell} \right].
+$$
+
+The model evidence is therefore
+
+$$
+p(\mathbf D\mid M_{\text{GT,in}}) = \int_0^1 p(\mathbf D\mid\lambda,M_{\text{GT,in}}) p(\lambda\mid M_{\text{GT,in}}) \,d\lambda
+$$
+
+$$
+= \int_0^1 \prod_{j=1}^{J} \left[ \binom{K}{c_j}^{-1} \frac{(1-\lambda)^{c_j}} {\sum_{\ell=0}^{K}(1-\lambda)^\ell} \right] \frac{ \lambda^{\alpha-1}(1-\lambda)^{\beta-1} }{ B(\alpha,\beta) } \,d\lambda .
+$$
+
+This integral does not reduce to the conjugate closed form and is therefore evaluated numerically using Stan and bridge sampling.
+
+**2.2.2.2 Perturbation degree** $d_k$
+
+Since $d_k\in\{0,1,\dots,J\}$, the truncated geometric model is
+
+$$
+p(d_k=r\mid\lambda,M_{\text{GT,out}}) = \frac{(1-\lambda)^r}{\sum_{\ell=0}^{J}(1-\lambda)^\ell}, \qquad r=0,\dots,J,
+$$
+
+$$
+\lambda\mid M_{\mathrm{GT,out}} \sim \operatorname{Beta}(\alpha,\beta). 
+$$
+
+Assume that all edge configurations with the same out-degree $d_k$ are exchangeable, then
+
+$$
+p(\boldsymbol{\delta}_{k\cdot}\mid d_k,M_{\text{GT,out}}) = \binom{J}{d_k}^{-1}.
+$$
+
+Therefore,
+
+$$
+p(\boldsymbol{\delta}_{k\cdot}\mid\lambda,M_{\text{GT,out}}) = \binom{J}{d_k}^{-1} \frac{(1-\lambda)^{d_k}}{\sum_{\ell=0}^{J}(1-\lambda)^\ell}.
+$$
+
+Assuming perturbations are conditionally independent given $\lambda$,
+
+$$
+p(\mathbf D\mid\lambda,M_{\text{GT,out}}) = \prod_{k=1}^{K} \left[ \binom{J}{d_k}^{-1} \frac{(1-\lambda)^{d_k}}{\sum_{\ell=0}^{J}(1-\lambda)^\ell} \right].
+$$
+
+The model evidence is
+
+$$
+p(\mathbf D\mid M_{\text{GT,out}}) = \int_0^1 p(\mathbf D\mid\lambda,M_{\text{GT,out}}) p(\lambda\mid M_{\text{GT,out}}) \,d\lambda
+$$
+
+$$
+= \int_0^1 \prod_{k=1}^{K} \left[ \binom{J}{d_k}^{-1} \frac{(1-\lambda)^{d_k}} {\sum_{\ell=0}^{J}(1-\lambda)^\ell} \right] \frac{ \lambda^{\alpha-1}(1-\lambda)^{\beta-1} }{ B(\alpha,\beta) } \,d\lambda. 
+$$
+
+### **2.3** $M_\text{SZ}$: **Shifted Zipf Model**
+
+#### **2.3.1 Target degree** $c_j$
+
+Since $c_j$ can be zero, Zipf's law is applied to $c_j+1$. The truncated shifted Zipf distribution is
+
+$$
+p(c_j=k\mid s,M_{\text{SZ,in}}) = \frac{(k+1)^{-s}}{\sum_{\ell=0}^{K}(\ell+1)^{-s}}, \qquad k=0,\dots,K.
+$$
+
+As above, assume that all edge configurations with the same in-degree $c_j$ are exchangeable:
+
+$$
+p(\boldsymbol{\delta}_{\cdot j}\mid c_j,M_{\text{SZ,in}}) = \binom{K}{c_j}^{-1}.
+$$
+
+Therefore,
+
+$$
+p(\boldsymbol{\delta}_{\cdot j}\mid s,M_{\text{SZ,in}}) = p(\boldsymbol{\delta}_{\cdot j}\mid c_j,M_{\text{SZ,in}}) p(c_j\mid s,M_{\text{SZ,in}})
+$$
+
+$$
+= \binom{K}{c_j}^{-1} \frac{(c_j+1)^{-s}}{\sum_{\ell=0}^{K}(\ell+1)^{-s}}.
+$$
+
+Assuming target genes are conditionally independent given $s$,
+
+$$
+p(\mathbf D\mid s,M_{\text{SZ,in}}) = \prod_{j=1}^{J} \left[ \binom{K}{c_j}^{-1} \frac{(c_j+1)^{-s}}{\sum_{\ell=0}^{K}(\ell+1)^{-s}} \right].
+$$
+
+The model evidence is
+
+$$p(\mathbf D\mid M_{\text{SZ,in}}) = \int p(\mathbf D\mid s,M_{\text{SZ,in}}) p(s\mid M_{\text{SZ,in}}) \,ds$$
+
+$$
+= \int \prod_{j=1}^{J} \left[ \binom{K}{c_j}^{-1} \frac{(c_j+1)^{-s}}{\sum_{\ell=0}^{K}(\ell+1)^{-s}} \right] p(s\mid M_{\text{SZ,in}}) \,ds.
+$$
+
+This evidence is evaluated using Stan and bridge sampling.
+
+#### **2.3.2 Perturbation degree** $d_k$
+
+For the perturbation out-degree,
+
+$$
+p(d_k=r\mid s,M_{\text{SZ,out}}) = \frac{(r+1)^{-s}}{\sum_{\ell=0}^{J}(\ell+1)^{-s}}, \qquad r=0,\dots,J.
+$$
+
+Assume that all outgoing edge configurations with the same out-degree $d_k$ are exchangeable:
+
+$$
+p(\boldsymbol{\delta}_{k\cdot}\mid d_k,M_{\text{SZ,out}}) = \binom{J}{d_k}^{-1}.
+$$
+
+Therefore,
+
+$$
+p(\boldsymbol{\delta}_{k\cdot}\mid s,M_{\text{SZ,out}}) = \binom{J}{d_k}^{-1} \frac{(d_k+1)^{-s}}{\sum_{\ell=0}^{J}(\ell+1)^{-s}}.
+$$
+
+Assuming perturbations are conditionally independent given $s$,
+
+$$
+p(\mathbf D\mid s,M_{\text{SZ,out}}) = \prod_{k=1}^{K} \left[ \binom{J}{d_k}^{-1} \frac{(d_k+1)^{-s}}{\sum_{\ell=0}^{J}(\ell+1)^{-s}} \right].
+$$
+
+The model evidence is
+
+$$
+p(\mathbf D\mid M_{\text{SZ,out}}) = \int p(\mathbf D\mid s,M_{\text{SZ,out}}) p(s\mid M_{\text{SZ,out}}) \,ds
+$$
+
+$$
+= \int \prod_{k=1}^{K} \left[ \binom{J}{d_k}^{-1} \frac{(d_k+1)^{-s}}{\sum_{\ell=0}^{J}(\ell+1)^{-s}} \right] p(s\mid M_{\text{SZ,out}}) \,ds.
+$$
+
+## **3. Bernoulli Models**
+
+The three Bernoulli models are:
+
+-   $M_\text{HBI}$: Independent Heterogeneous Bernoulli Model
+
+-   $M_\text{HBG}$: Global Heterogeneous Bernoulli Model
+
+-   $M_\text{HBRF1}$: Rank-1 Factorized Heterogeneous Bernoulli Model
+
+### **3.1** $M_\text{HBI}$: **Independent Heterogeneous Bernoulli Model**
+
+$$
+\delta_{kj} \mid \pi_{kj},M_{\text{HBI}}
+\overset{\text{ind}}{\sim}
+\operatorname{Bernoulli}(\pi_{kj}),
+\qquad
+\pi_{kj}\mid M_{\text{HBI}}\sim\operatorname{Beta}(\alpha,\beta).
+$$
+
+**Model evidence:**
+
+Integrating out edge-specific probabilities $\pi_{kj}$,
+
+$$
+p(\delta_{kj} \mid M_{\text{HBI}})=
+\int
+p(\delta_{kj}\mid\pi_{kj},M_{\text{HBI}})
+p(\pi_{kj} \mid M_{\text{HBI}})
+\,d\pi_{kj}
+$$
+
+$$
+=\int
+\pi_{kj}^{\delta_{kj}}
+(1-\pi_{kj})^{1-\delta_{kj}}
+\frac {\pi_{kj}^{\alpha-1}
+(1-\pi_{kj})^{\beta-1}}{B(\alpha,\beta)}
+\,d\pi_{kj}
+$$
+
+$$
+= \frac{1}{B(\alpha,\beta)}
+\int
+\pi_{kj}^{\alpha+\delta_{kj}-1}
+(1-\pi_{kj})^{\beta+1-\delta_{kj}-1}
+\,d\pi_{kj}
+$$
+
+$$
+= \frac{B(\alpha+\delta_{kj},\beta+1-\delta_{kj})}{B(\alpha,\beta)}.
+$$
+
+When $\delta_{kj}=1$,
+
+$$
+p(\delta_{kj}=1\mid M_{\text{HBI}})=
+\frac{B(\alpha+1,\beta)}{B(\alpha,\beta)} = \frac{\alpha}{\alpha+\beta}.
+$$
+
+When $\delta_{kj}=0$,
+
+$$
+p(\delta_{kj}=0 \mid M_{\text{HBI}})=
+\frac{\beta}{\alpha+\beta}.
+$$
+
+Because different $\pi_{kj}$'s are independent, so marginally,
+
+$$
+\delta_{kj} \mid M_{\text{HBI}}
+\overset{\text{ind}}{\sim}
+\operatorname{Bernoulli}
+\left(
+\frac{\alpha}{\alpha+\beta}
+\right).
+$$
+
+Let $S=\sum_k\sum_j\delta_{kj}$ represent the total number of edges, then
+
+$$
+p(\mathbf D\mid M_{\text{HBI}})=
+\prod_{k=1}^{K} \prod_{j=1}^{J}p(\delta_{kj} \mid M_{\text{HBI}})=
+\left(
+\frac{\alpha}{\alpha+\beta}
+\right)^S
+\left(
+\frac{\beta}{\alpha+\beta}
+\right)^{KJ-S}.
+$$
+
+**Posterior predictive:**
+
+For a newly generated edge $\tilde{\delta}_{kj}$ with a newly drawn independent edge-specific probability $\tilde{\pi}_{kj}$, the observed matrix $\mathbf D$ provides no information about $\tilde{\pi}_{kj}$. Therefore, the prior predictive and posterior predictive distributions are identical:
+
+$$
+p(\tilde \delta_{kj}​ = 1∣\mathbf D,M_{\text{HBI}})=p(\tilde \delta_{kj}​ = 1 \mid M_{\text{HBI}})​ = \frac{\alpha}{\alpha+\beta}.
+$$
+
+### **3.2** $M_\text{HBG}$: **Global Heterogeneous Bernoulli Model**
+
+$$
+\delta_{kj} \mid \pi, M_{\text{HBG}}\sim\operatorname{Bernoulli}(\pi), \quad \pi\mid M_{\text{HBG}}\sim\operatorname{Beta}(\alpha,\beta).
+$$
+
+**Model evidence:**
+
+$$
+p(\mathbf D\mid M_{\text{HBG}}) = \int_0^1  p(\mathbf D\mid\pi,M_{\text{HBG}})p(\pi\mid M_{\text{HBG}})\,d\pi
+$$
+
+$$
+= \int_0^1  \left[ \prod_{k=1}^{K}\prod_{j=1}^{J} \pi^{\delta_{kj}} (1-\pi)^{1-\delta_{kj}} \right] \frac{\pi^{\alpha-1}(1-\pi)^{\beta-1}} {B(\alpha,\beta)} \,d\pi
+$$
+
+$$
+= \frac{1}{B(\alpha,\beta)} \int_0^1 \pi^S(1-\pi)^{KJ-S} \pi^{\alpha-1}(1-\pi)^{\beta-1} \,d\pi
+$$
+
+$$
+= \frac{1}{B(\alpha,\beta)} \int_0^1 \pi^{\alpha+S-1} (1-\pi)^{\beta+KJ-S-1} \,d\pi
+$$
+
+$$
+= \frac{B(\alpha+S,\beta+KJ-S)} {B(\alpha,\beta)}.
+$$
+
+**Posterior predictive:**
+
+Using Bayes' theorem,
+
+$$
+p(\pi\mid\mathbf D,M_{\text{HBG}}) = \frac{p(\mathbf D\mid\pi,M_{\text{HBG}})p(\pi \mid M_{\text{HBG}})} {p(\mathbf D \mid M_{\text{HBG}})}
+$$
+
+$$
+= \frac{B(\alpha, \beta)}{B(\alpha+S, \beta+KJ-S)} \frac{1} {B(\alpha, \beta)} \pi^{\alpha+S-1} (1-\pi)^{\beta+KJ-S-1}
+$$
+
+$$
+= \frac{1}{B(\alpha+S, \beta+KJ-S)} \pi^{\alpha+S-1} (1-\pi)^{\beta+KJ-S-1}
+$$
+
+$$
+=\operatorname{Beta} (\alpha+S,\beta+KJ-S). 
+$$
+
+Thus, for a new edge $\tilde{\delta}_{kj}$,
+
+$$
+p(\tilde{\delta}_{kj}\mid\mathbf D, M_{\text{HBG}}) = \int_0^1  p(\tilde{\delta}_{kj}\mid\pi, M_{\text{HBG}}) p(\pi\mid\mathbf D, M_{\text{HBG}}) \,d\pi
+$$
+
+$$
+= \frac{1}{B(\alpha+S,\beta+KJ-S)} \int_0^1 \pi^{\tilde{\delta}_{kj}} (1-\pi)^{1-\tilde{\delta}_{kj}} \pi^{\alpha+S-1} (1-\pi)^{\beta+KJ-S-1} \,d\pi
+$$
+
+$$
+= \frac{1}{B(\alpha+S,\beta+KJ-S)} \int_0^1 \pi^{\alpha+S+\tilde{\delta}_{kj}-1} (1-\pi)^{\beta+KJ-S+1-\tilde{\delta}_{kj}-1} \,d\pi
+$$
+
+$$
+= \frac{ B(\alpha+S+\tilde{\delta}_{kj}, \beta+KJ-S+1-\tilde{\delta}_{kj}) }{ B(\alpha+S,\beta+KJ-S) }.
+$$
+
+When $\tilde{\delta}_{kj}=1$,
+
+$$
+p(\tilde{\delta}_{kj}=1\mid\mathbf D, M_{\text{HBG}}) = \frac{ B(\alpha+S+1,\beta+KJ-S) }{ B(\alpha+S,\beta+KJ-S) }
+$$
+
+$$
+=\frac{\alpha+S} {\alpha+\beta+KJ}.
+$$
+
+### **3.3** $M_\text{HBRF1}$: **Rank-1 Factorized Heterogeneous Bernoulli Model**
+
+$$
+\delta_{kj} \mid \pi_{kj}, M_{\text{HBRF1}}\overset{\text{ind}}{\sim} \operatorname{Bernoulli}(\pi_{kj}), \qquad k=1,\ldots,K,\quad j=1,\ldots,J
+$$
+
+$$
+\pi_{kj}=\psi_k\phi_j, \quad \psi_k \mid M_{\text{HBRF1}}\sim \operatorname{Beta}(\alpha_\psi,\beta_\psi), \quad \phi_j \mid M_{\text{HBRF1}}\sim \operatorname{Beta}(\alpha_\phi,\beta_\phi).
+$$
+
+Here, $\psi_k$ represents the perturbation-specific contribution to the edge probability, whereas $\phi_j$ represents the target-specific contribution.
+
+Define the perturbation-factor vector and target-factor vector as
+
+$$
+ \boldsymbol\psi=(\psi_1,\ldots,\psi_K), \quad \boldsymbol\phi=(\phi_1,\ldots,\phi_J).
+$$
+
+Conditional on $\boldsymbol{\psi}$ and $\boldsymbol{\phi}$, the edges $\delta_{kj}$ are independent. However, because edges in the same row share $\psi_k$ and edges in the same column share $\phi_j$, they are not marginally independent after the latent variables are integrated out.
+
+#### **3.3.1 Target degree** $c_j$
+
+To obtain a simpler marginal representation of the in-degree distribution, we condition on $\phi_j$ and integrate out $\psi_k$:
+
+$$
+p(\delta_{kj}=1\mid\phi_j, M_{\text{HBRF1}}) = \int_0^1 p(\delta_{kj}=1\mid\psi_k,\phi_j, M_{\text{HBRF1}}) p(\psi_k \mid M_{\text{HBRF1}}) \,d\psi_k
+$$
+
+$$
+= \int_0^1 \psi_k\phi_j p(\psi_k \mid M_{\text{HBRF1}}) \,d\psi_k
+$$
+
+$$
+= E[\psi_k]\phi_j.
+$$
+
+Since
+
+$$
+E[\psi_k] = \int_0^1 \psi_k \cdot \left[ \frac{1}{B(\alpha_\psi, \beta_\psi)} \, \psi_k^{\alpha_\psi - 1} (1 - \psi_k)^{\beta_\psi - 1} \right] d\psi_k
+$$
+
+$$
+= \frac{B(\alpha_\psi + 1, \beta_\psi)}{B(\alpha_\psi, \beta_\psi)}
+$$
+
+$$
+= \frac{\alpha_\psi} {\alpha_\psi+\beta_\psi},
+$$
+
+we define $\mu_\psi = E[\psi_k] = \frac{\alpha_\psi} {\alpha_\psi+\beta_\psi}$, then
+
+$$
+p(\delta_{kj}=1\mid\phi_j, M_{\text{HBRF1}}) = \mu_\psi\phi_j.
+$$
+
+Therefore, the in-degree model can be represented by the simplified model
+
+$$
+c_j\mid\phi_j, M_{\text{HBRF1S,in}} \sim \operatorname{Binomial} (K,\mu_\psi\phi_j), 
+$$
+
+$$
+\qquad \mu_\psi = \frac{\alpha_\psi} {\alpha_\psi+\beta_\psi}, \qquad \phi_j \mid M_{\text{HBRF1S,in}}\sim \operatorname{Beta}(\alpha_\phi,\beta_\phi).
+$$
+
+Hence,
+
+$$
+p(c_j\mid\phi_j, M_{\text{HBRF1S,in}}) = \binom{K}{c_j} (\mu_\psi\phi_j)^{c_j} (1-\mu_\psi\phi_j)^{K-c_j}.
+$$
+
+Conditional on $c_j$, all $\binom{K}{c_j}$ edge configurations are exchangeable. Therefore
+
+$$
+p(\boldsymbol{\delta}_{\cdot j} \mid c_j,M_{\text{HBRF1S,in}}) = \binom{K}{c_j}^{-1}.
+$$
+
+Because $c_j$ is a deterministic function of $\boldsymbol{\delta}_{\cdot j}$,
+
+$$
+p(\boldsymbol{\delta}_{\cdot j} \mid \phi_j, M_{\text{HBRF1S,in}}) = p(\boldsymbol{\delta}_{\cdot j} \mid c_j, M_{\text{HBRF1S,in}}) p(c_j \mid \phi_j, M_{\text{HBRF1S,in}}) 
+$$
+
+$$
+= (\mu_{\psi} \phi_j)^{c_j} (1 - \mu_{\psi} \phi_j)^{K - c_j}.
+$$
+
+Conditional on $\boldsymbol{\phi}$, the likelihood of the edge matrix $\mathbf D=(\delta_{kj})_{K\times J}$ is
+
+$$
+p(\mathbf{D} \mid \boldsymbol{\phi}, M_{\mathrm{HBRF1S,in}}) = \prod_{j=1}^{J} (\mu_\psi \phi_j)^{c_j} (1 - \mu_\psi \phi_j)^{K - c_j}
+$$
+
+Integrating out $\boldsymbol{\phi}$,
+
+$$
+p(\mathbf{D} \mid M_{\mathrm{HBRF1S,in}}) = \int_{[0,1]^J} p(\mathbf{D} \mid \boldsymbol{\phi}, M_{\mathrm{HBRF1S,in}}) \, p(\boldsymbol{\phi} \mid M_{\mathrm{HBRF1S,in}}) \, d\boldsymbol{\phi}
+$$
+
+$$
+= \int_{[0,1]^J} \prod_{j=1}^{J} \left[ (\mu_\psi \phi_j)^{c_j} (1 - \mu_\psi \phi_j)^{K - c_j} \frac{\phi_j^{\alpha_\phi - 1} (1 - \phi_j)^{\beta_\phi - 1}}{B(\alpha_\phi, \beta_\phi)} \right] d\boldsymbol{\phi}
+$$
+
+$$
+=\prod_{j=1}^{J} \int_0^1 (\mu_\psi \phi_j)^{c_j} (1 - \mu_\psi \phi_j)^{K - c_j} \frac{\phi_j^{\alpha_\phi - 1} (1 - \phi_j)^{\beta_\phi - 1}}{B(\alpha_\phi, \beta_\phi)} \, d\phi_j.
+$$
+
+This integral does not reduce to the conjugate closed form and is therefore evaluated numerically using Stan and bridge sampling.
+
+#### **3.3.2 Perturbation degree** $d_k$
+
+Similarly, we define $\mu_\phi = E[\phi_j] = \frac{\alpha_\phi} {\alpha_\phi+\beta_\phi}$ and condition on $\psi_k$,
+
+$$
+p(\delta_{kj}=1\mid\psi_k, M_{\text{HBRF1}}) = \mu_\phi\psi_k.
+$$
+
+Therefore, the out-degree model can also be represented by the simplified model
+
+$$
+d_k\mid\psi_k,M_{\text{HBRF1S,out}} \sim \operatorname{Binomial} (J,\mu_\phi\psi_k), 
+$$
+
+$$
+\mu_\phi = \frac{\alpha_\phi} {\alpha_\phi+\beta_\phi}, \quad \psi_k \mid M_{\text{HBRF1S,out}}\sim \operatorname{Beta}(\alpha_\psi,\beta_\psi).
+$$
+
+Exchangeability across the $\binom{J}{d_k}$ row configurations gives:
+
+$$
+p(\boldsymbol{\delta}_{k \cdot} \mid \psi_k, M_{\mathrm{HBRF1S,out}}) = (\mu_\phi \psi_k)^{d_k} (1 - \mu_\phi \psi_k)^{J - d_k}
+$$
+
+Conditioned on $\boldsymbol{\psi} = (\psi_1, \ldots, \psi_K)$, row edge vectors $\boldsymbol{\delta}_{1 \cdot}, \ldots, \boldsymbol{\delta}_{K \cdot}$ are independent:
+
+$$
+p(\mathbf{D} \mid \boldsymbol{\psi}, M_{\mathrm{HBRF1S,out}}) = \prod_{k=1}^{K} (\mu_\phi \psi_k)^{d_k} (1 - \mu_\phi \psi_k)^{J - d_k}
+$$
+
+Integrating out $\boldsymbol{\psi}$,
+
+$$
+p(\mathbf{D} \mid M_{\mathrm{HBRF1S,out}}) = \prod_{k=1}^{K} \int_0^1 (\mu_\phi \psi_k)^{d_k} (1 - \mu_\phi \psi_k)^{J - d_k} \frac{\psi_k^{\alpha_\psi - 1} (1 - \psi_k)^{\beta_\psi - 1}}{B(\alpha_\psi, \beta_\psi)} \, d\psi_k.
+$$
+
+## **4. Model Fit**
+
+Model fit is assessed using two complementary criteria:
+
+-   **Model evidence:** for models with analytically tractable marginal likelihoods, the derived closed-form expressions are used directly without Stan. For models without closed-form solutions, bridge sampling is applied to the fitted Stan model to estimate the marginal likelihood.
+
+-   **Posterior predictive checks:** posterior predictive distributions are obtained either directly from the analytical posterior distributions or from posterior draws generated by Stan.
+
+The in-degree and out-degree marginal models are fitted separately. In particular, the in-degree and out-degree likelihoods are not multiplied because the degree vectors $\mathbf c=(c_1,\ldots,c_J)$ and $\mathbf d=(d_1,\ldots,d_K)$ are both determined by the same edge matrix $\mathbf D$ and are therefore dependent.
+
+*Note:* For hyperparameter selection of $M_\text{GT}$ and $M_\text{HBRF1S}$, the marginal likelihood is evaluated by direct numerical integration over the specified hyperparameter grid. After selecting the evidence-maximizing hyperparameters, Stan is used for posterior inference and bridge sampling is used for the final marginal-likelihood estimate.
+
+```{r}
+fdr_name <- "FDR_0.01"
+fdr_label <- sub("FDR_", "", fdr_name)
+
+# D = K perturbations x J target genes
+D <- t(as.matrix(degree_results[[fdr_name]]$edge_mat))
+storage.mode(D) <- "integer"
+
+K <- nrow(D)
+J <- ncol(D)
+
+# Target in-degree c_j
+c_obs <- as.integer(colSums(D))
+
+# Perturbation out-degree d_k
+d_obs <- as.integer(rowSums(D))
+
+# Total number of edges
+S_obs <- sum(D)
+```
+
+```{r}
+# Closed-form model evidence
+# M_BB,in
+log_evidence_BB_in <- function(alpha, beta, c, K) {
+  sum(lbeta(alpha + c, beta + K - c) - lbeta(alpha, beta))
+}
+
+# M_BB,out
+log_evidence_BB_out <- function(alpha, beta, d, J) {
+  sum(lbeta(alpha + d, beta + J - d) - lbeta(alpha, beta))
+}
+
+# M_GU,in
+log_evidence_GU_in <- function(alpha, beta, c, K) {
+  
+  J <- length(c)
+  S <- sum(c)
+
+  -sum(lchoose(K, c)) + lbeta(alpha + J, beta + S) - lbeta(alpha, beta)
+}
+
+# M_GU,out
+log_evidence_GU_out <- function(alpha, beta, d, J) {
+
+  K <- length(d)
+  S <- sum(d)
+
+  -sum(lchoose(J, d)) + lbeta(alpha + K, beta + S) - lbeta(alpha, beta)
+}
+
+# M_HBG
+log_evidence_HBG <- function(alpha, beta, S, K, J) {
+  lbeta(alpha + S, beta + K * J - S) - lbeta(alpha, beta)
+}
+
+# Optimize the closed-form Beta hyperparameters: mu in [0.1, 0.9], kappa in [1, 100]
+optimize_hyperparameters <- function(log_evidence, ...) {
+
+  opt <- optim(par = c(mu = 0.5, kappa = 10),
+
+    fn = function(par) {
+      mu <- par[1]
+      kappa <- par[2]
+
+      alpha <- mu * kappa
+      beta <- (1 - mu) * kappa
+
+      -do.call(log_evidence, c(list(alpha = alpha, beta = beta), list(...)))
+    },
+
+    method = "L-BFGS-B",
+    lower = c(0.1, 1),
+    upper = c(0.9, 100)
+  )
+
+  mu <- opt$par[1]
+  kappa <- opt$par[2]
+
+  tibble(mu = mu, kappa = kappa, alpha = mu * kappa, 
+         beta = (1 - mu) * kappa, log_evidence = -opt$value)
+}
+
+# M_BB,in
+opt_BB_in <- optimize_hyperparameters(log_evidence = log_evidence_BB_in, 
+                                      c = c_obs, K = K)
+
+# M_BB,out
+opt_BB_out <- optimize_hyperparameters(log_evidence = log_evidence_BB_out, 
+                                       d = d_obs, J = J)
+
+# M_GU,in
+opt_GU_in <- optimize_hyperparameters(log_evidence = log_evidence_GU_in, 
+                                      c = c_obs, K = K)
+
+# M_GU,out
+opt_GU_out <- optimize_hyperparameters(log_evidence = log_evidence_GU_out, 
+                                       d = d_obs, J = J)
+
+# M_HBG
+opt_HBG <- optimize_hyperparameters(log_evidence = log_evidence_HBG, 
+                                    S = S_obs, K = K, J = J)
+
+# M_HBI
+opt_HBI_raw <- optimize(f = function(mu) {
+  -(S_obs * log(mu) + (K * J - S_obs) * log(1 - mu))
+  }, 
+  interval = c(0.1, 0.9))
+opt_HBI <- tibble(mu = opt_HBI_raw$minimum, log_evidence = -opt_HBI_raw$objective)
+```
+
+```{r}
+# Truncated Geometric
+dir.create("stan_models", showWarnings = FALSE)
+
+writeLines('
+data {
+  int<lower=1> K;
+  int<lower=1> J;
+  array[K, J] int<lower=0, upper=1> D;
+
+  // 1 = in-degree, 2 = out-degree
+  int<lower=1, upper=2> degree_type;
+
+  real<lower=0> alpha;
+  real<lower=0> beta;
+}
+
+transformed data {
+  array[J] int c;
+  array[K] int d;
+  int S;
+
+  // c_j = sum_k delta_kj
+  for (j in 1:J) {
+    c[j] = 0;
+
+    for (k in 1:K) {
+      c[j] += D[k, j];
+    }
+  }
+
+  // d_k = sum_j delta_kj
+  for (k in 1:K) {
+    d[k] = 0;
+
+    for (j in 1:J) {
+      d[k] += D[k, j];
+    }
+  }
+
+  // S = total number of edges
+  S = 0;
+
+  for (j in 1:J) {
+    S += c[j];
+  }
+}
+
+parameters {
+  real<lower=0, upper=1> lambda;
+}
+
+model {
+  real log_one_minus_lambda;
+
+  target += beta_lpdf(lambda | alpha, beta);
+
+  log_one_minus_lambda = log1m(lambda);
+
+  // M_GT,in
+  if (degree_type == 1) {
+
+    vector[K + 1] log_terms;
+    real log_config;
+
+    log_config = 0;
+
+    for (j in 1:J) {
+      log_config += lchoose(K, c[j]);
+    }
+
+    for (l in 0:K) {
+      log_terms[l + 1] = l * log_one_minus_lambda;
+    }
+
+    target += -log_config + S * log_one_minus_lambda - J * log_sum_exp(log_terms);
+  }
+
+  // M_GT,out
+  if (degree_type == 2) {
+
+    vector[J + 1] log_terms;
+    real log_config;
+
+    log_config = 0;
+
+    for (k in 1:K) {
+      log_config += lchoose(J, d[k]);
+    }
+
+    for (l in 0:J) {
+      log_terms[l + 1] = l * log_one_minus_lambda;
+    }
+
+    target += -log_config + S * log_one_minus_lambda - K * log_sum_exp(log_terms);
+  }
+}
+', "stan_models/truncated_geometric.stan")
+
+stan_GT <- stan_model("stan_models/truncated_geometric.stan")
+
+# log model evidence for the hyperparameter grid search
+log_evidence_GT <- function(alpha, beta, degree, max_degree) {
+
+  N <- length(degree)
+  S <- sum(degree)
+
+  # Probability of the specific observed edge configuration
+  log_config <- -sum(lchoose(max_degree, degree))
+
+  # Log integrand after lambda = logistic(t)
+  logf <- function(t) {
+
+    lambda <- plogis(t)
+    log_lambda <- plogis(t, log.p = TRUE)
+    log1m <- plogis(t, lower.tail = FALSE, log.p = TRUE)
+
+    # Z(lambda)
+    logZ <- numeric(length(t))
+
+    at_zero <- lambda == 0
+    at_one <- lambda == 1
+    middle <- !(at_zero | at_one)
+
+    # lim lambda -> 0: Z = max_degree + 1
+    logZ[at_zero] <- log(max_degree + 1)
+
+    # lim lambda -> 1: Z = 1
+    logZ[at_one] <- 0
+
+    logZ[middle] <- log(-expm1((max_degree + 1) * log1m[middle])) - log_lambda[middle]
+    alpha * log_lambda + (beta + S) * log1m - N * logZ - lbeta(alpha, beta)
+  }
+
+  # Scaling constant only for numerical stability
+  mode <- optimize(
+    function(t) -logf(t),
+    interval = c(-100, 100)
+  )
+  m <- -mode$objective
+
+  val <- integrate(
+    function(t) {
+      exp(logf(t) - m)
+    },
+    lower = -Inf,
+    upper = Inf,
+    subdivisions = 2000,
+    rel.tol = 1e-8
+  )$value
+
+  log_config + m + log(val)
+}
+
+# Hyperparameter grid search because model evidence is not closed form
+mu_grid <- seq(0.1, 0.9, by = 0.1)
+kappa_grid <- c(1, 3, 10, 30, 100)
+
+hp_grid <- tidyr::expand_grid(mu = mu_grid, kappa = kappa_grid) %>%
+  mutate(alpha = mu * kappa, beta = (1 - mu) * kappa)
+
+# M_GT,in
+GT_in_grid <- hp_grid %>%
+  rowwise() %>%
+  mutate(log_evidence =log_evidence_GT(alpha = alpha, beta = beta,
+                                       degree = c_obs, max_degree = K)) %>%
+  ungroup() %>%
+  arrange(desc(log_evidence))
+
+best_GT_in <- GT_in_grid %>%
+  slice(1)
+
+# M_GT,out
+GT_out_grid <- hp_grid %>%
+  rowwise() %>%
+  mutate(log_evidence = log_evidence_GT(alpha = alpha, beta = beta,
+                                        degree = d_obs, max_degree = J)) %>%
+  ungroup() %>%
+  arrange(desc(log_evidence))
+
+best_GT_out <- GT_out_grid %>%
+  slice(1)
+
+# Fit M_GT using optimized hyperparameters
+stan_GT_in_data <- list(K = K, J = J, D = D, degree_type = 1L, 
+                        alpha = best_GT_in$alpha[[1]], beta = best_GT_in$beta[[1]])
+fit_GT_in <- sampling(stan_GT, data = stan_GT_in_data, iter = 10000, warmup = 2000, 
+                      chains = 3, seed = 123, cores = 1)
+bridge_GT_in <- bridge_sampler(fit_GT_in, silent = TRUE)
+logml_GT_in <- bridge_GT_in$logml
+
+stan_GT_out_data <- list(K = K, J = J, D = D, degree_type = 2L, 
+                         alpha = best_GT_out$alpha[[1]], beta = best_GT_out$beta[[1]])
+fit_GT_out <- sampling(stan_GT, data = stan_GT_out_data, iter = 10000, warmup = 2000,
+                       chains = 3, seed = 123, cores = 1)
+bridge_GT_out <- bridge_sampler(fit_GT_out, silent = TRUE)
+logml_GT_out <- bridge_GT_out$logml
+
+# MCMC convergence
+summary(fit_GT_in)$summary[, c("n_eff", "Rhat")]
+summary(fit_GT_out)$summary[, c("n_eff", "Rhat")]
+```
+
+```{r}
+# Shifted Zipf
+writeLines('
+data {
+  int<lower=1> K;
+  int<lower=1> J;
+  array[K, J] int<lower=0, upper=1> D;
+
+  // 1 = in-degree, 2 = out-degree
+  int<lower=1, upper=2> degree_type;
+}
+
+transformed data {
+  array[J] int c;
+  array[K] int d;
+
+  // c_j = sum_k delta_kj
+  for (j in 1:J) {
+    c[j] = 0;
+
+    for (k in 1:K) {
+      c[j] += D[k, j];
+    }
+  }
+
+  // d_k = sum_j delta_kj
+  for (k in 1:K) {
+    d[k] = 0;
+
+    for (j in 1:J) {
+      d[k] += D[k, j];
+    }
+  }
+}
+
+parameters {
+  real<lower=1e-6, upper=10> s;
+}
+
+model {
+  target += uniform_lpdf(s | 1e-6, 10);
+
+  // M_SZ,in
+  if (degree_type == 1) {
+
+    vector[K + 1] log_terms;
+    real log_config;
+    real sum_log;
+
+    log_config = 0;
+    sum_log = 0;
+
+    for (j in 1:J) {
+      log_config += lchoose(K, c[j]);
+      sum_log += log(c[j] + 1);
+    }
+
+    for (l in 0:K) {
+      log_terms[l + 1] = -s * log(l + 1);
+    }
+
+    target += -log_config -s * sum_log -J * log_sum_exp(log_terms);
+  }
+
+  // M_SZ,out
+  if (degree_type == 2) {
+
+    vector[J + 1] log_terms;
+    real log_config;
+    real sum_log;
+
+    log_config = 0;
+    sum_log = 0;
+
+    for (k in 1:K) {
+      log_config += lchoose(J, d[k]);
+      sum_log += log(d[k] + 1);
+    }
+
+    for (l in 0:J) {
+      log_terms[l + 1] = -s * log(l + 1);
+    }
+
+    target += -log_config -s * sum_log -K * log_sum_exp(log_terms);
+  }
+}
+', "stan_models/shifted_zipf.stan")
+
+stan_SZ <- stan_model("stan_models/shifted_zipf.stan")
+
+# M_SZ,in
+stan_SZ_in_data <- list(K = K, J = J, D = D, degree_type = 1L)
+fit_SZ_in <- sampling(stan_SZ, data = stan_SZ_in_data, iter = 10000, warmup = 2000, chains = 3, seed = 123, cores = 1)
+bridge_SZ_in <- bridge_sampler(fit_SZ_in, silent = TRUE)
+logml_SZ_in <- bridge_SZ_in$logml
+
+# M_SZ,out
+stan_SZ_out_data <- list(K = K, J = J, D = D, degree_type = 2L)
+fit_SZ_out <- sampling(stan_SZ, data = stan_SZ_out_data, iter = 10000, warmup = 2000, chains = 3, seed = 123, cores = 1)
+bridge_SZ_out <- bridge_sampler(fit_SZ_out, silent = TRUE)
+logml_SZ_out <- bridge_SZ_out$logml
+
+# MCMC convergence
+summary(fit_SZ_in)$summary[, c("n_eff", "Rhat")]
+summary(fit_SZ_out)$summary[, c("n_eff", "Rhat")]
+```
+
+```{r}
+# HBRF1S in-degree
+writeLines('
+data {
+  int<lower=1> K;
+  int<lower=1> J;
+
+  array[K, J] int<lower=0, upper=1> D;
+
+  // mu_psi = E[psi_k]
+  real<lower=0, upper=1> mu_psi;
+
+  // phi_j ~ Beta(alpha_phi, beta_phi)
+  real<lower=1e-9> alpha_phi;
+  real<lower=1e-9> beta_phi;
+}
+
+transformed data {
+  array[J] int c;
+
+  // c_j = sum_k delta_kj
+  for (j in 1:J) {
+
+    c[j] = 0;
+
+    for (k in 1:K) {
+      c[j] += D[k, j];
+    }
+  }
+}
+
+parameters {
+  vector<lower=0, upper=1>[J] phi;
+}
+
+model {
+
+  // phi_j ~ Beta(alpha_phi, beta_phi)
+  target += beta_lpdf(phi | alpha_phi, beta_phi);
+
+  for (j in 1:J) {
+
+    real p_j;
+
+    p_j = mu_psi * phi[j];
+
+    target += binomial_lpmf(c[j] | K, p_j) - lchoose(K, c[j]);
+  }
+}
+', "stan_models/HBRF1S_in.stan")
+
+stan_HBRF1S_in <- stan_model("stan_models/HBRF1S_in.stan")
+
+# HBRF1S log model evidence for hyperparameter grid search
+# In-degree: mu_factor = mu_psi, alpha = alpha_phi, beta = beta_phi, degree = c_obs, max_degree = K
+# Out-degree: mu_factor = mu_phi, alpha = alpha_psi, beta = beta_psi, degree = d_obs, max_degree = J
+log_evidence_HBRF1S <- function(mu_factor, alpha, beta, degree, max_degree) {
+
+  degree_table <- table(degree)
+  degree_value <- as.integer(names(degree_table))
+  degree_freq <- as.numeric(degree_table)
+
+  # Marginal log probability for one specific edge configuration
+  log_marginal_one_degree <- function(x) {
+
+    logf <- function(t) {
+
+      theta <- plogis(t)
+
+      # Numerically stable log(theta) and log(1-theta)
+      log_theta <- plogis(t, log.p = TRUE)
+      log_one_minus_theta <- plogis(t, lower.tail = FALSE, log.p = TRUE)
+
+      # Exact log integrand after theta = logistic(t)
+      (
+        x * log(mu_factor) +
+          (x + alpha) * log_theta +
+          beta * log_one_minus_theta +
+          (max_degree - x) *
+            log1p(-mu_factor * theta) -
+          lbeta(alpha, beta)
+      )
+    }
+
+    # Find maximum only for numerical scaling
+    mode <- optimize(
+      function(t) -logf(t),
+      interval = c(-100, 100)
+    )
+    m <- -mode$objective
+
+    # Integrate
+    val <- integrate(
+      function(t) {
+        exp(logf(t) - m)
+      },
+      lower = -Inf,
+      upper = Inf,
+      subdivisions = 2000,
+      rel.tol = 1e-8
+    )$value
+
+    # Restore
+    m + log(val)
+  }
+
+  log_prob <- vapply(degree_value, log_marginal_one_degree, numeric(1))
+  sum(degree_freq * log_prob)
+}
+
+# Hyperparameter grid for HBRF1S in-degree
+# alpha_phi = mu_phi * kappa_phi
+# beta_phi  = (1 - mu_phi) * kappa_phi
+phi_hp_grid <- tidyr::expand_grid(mu_phi = mu_grid, kappa_phi = kappa_grid) %>%
+  mutate(alpha_phi = mu_phi * kappa_phi, beta_phi = (1 - mu_phi) * kappa_phi)
+HBRF1S_in_hp_grid <- tidyr::crossing(mu_psi = mu_grid, phi_hp_grid)
+
+# M_HBRF1S,in hyperparameter grid search
+HBRF1S_in_grid <- HBRF1S_in_hp_grid %>%
+  rowwise() %>%
+  mutate(log_evidence = log_evidence_HBRF1S(mu_factor = mu_psi, alpha = alpha_phi,
+                                            beta = beta_phi, degree = c_obs, 
+                                            max_degree = K)) %>%
+  ungroup() %>%
+  arrange(desc(log_evidence))
+
+# Select hyperparameters with highest model evidence
+best_HBRF1S_in <- HBRF1S_in_grid %>%
+  slice(1)
+
+# Fit HBRF1S in-degree using optimized hyperparameters
+stan_HBRF1S_in_data <- list(K = K, J = J, D = D,
+                            mu_psi = best_HBRF1S_in$mu_psi[[1]],
+                            alpha_phi = best_HBRF1S_in$alpha_phi[[1]],
+                            beta_phi = best_HBRF1S_in$beta_phi[[1]])
+
+fit_HBRF1S_in <- sampling(stan_HBRF1S_in, data = stan_HBRF1S_in_data, iter = 10000,
+                          warmup = 2000, chains = 3, seed = 123, cores = 1)
+
+# Save to run bridge_sampler on server
+# saveRDS(fit_HBRF1S_in, "fit_HBRF1S_in.rds")
+# saveRDS(stan_HBRF1S_in_data, "stan_HBRF1S_in_data.rds")
+
+# bridge_HBRF1S_in <- bridge_sampler(fit_HBRF1S_in, silent = TRUE)
+# logml_HBRF1S_in <- bridge_HBRF1S_in$logml
+
+# MCMC convergence
+# summary(fit_HBRF1S_in)$summary[, c("n_eff", "Rhat")]
+
+# HBRF1S out-degree
+writeLines('
+data {
+  int<lower=1> K;
+  int<lower=1> J;
+
+  array[K, J] int<lower=0, upper=1> D;
+
+  // mu_phi = E[phi_j]
+  real<lower=0, upper=1> mu_phi;
+
+  // psi_k ~ Beta(alpha_psi, beta_psi)
+  real<lower=1e-9> alpha_psi;
+  real<lower=1e-9> beta_psi;
+}
+
+transformed data {
+  array[K] int d;
+
+  // d_k = sum_j delta_kj
+  for (k in 1:K) {
+
+    d[k] = 0;
+
+    for (j in 1:J) {
+      d[k] += D[k, j];
+    }
+  }
+}
+
+parameters {
+  vector<lower=0, upper=1>[K] psi;
+}
+
+model {
+
+  // psi_k ~ Beta(alpha_psi, beta_psi)
+  target += beta_lpdf(psi | alpha_psi, beta_psi);
+
+  for (k in 1:K) {
+
+    real p_k;
+
+    p_k = mu_phi * psi[k];
+
+    target += binomial_lpmf(d[k] | J, p_k) - lchoose(J, d[k]);
+  }
+}
+', "stan_models/HBRF1S_out.stan")
+
+stan_HBRF1S_out <- stan_model("stan_models/HBRF1S_out.stan")
+
+# Hyperparameter grid for HBRF1S out-degree
+# alpha_psi = mu_psi * kappa_psi
+# beta_psi  = (1 - mu_psi) * kappa_psi
+psi_hp_grid <- tidyr::expand_grid(mu_psi = mu_grid, kappa_psi = kappa_grid) %>%
+  mutate(alpha_psi = mu_psi * kappa_psi, beta_psi = (1 - mu_psi) * kappa_psi)
+HBRF1S_out_hp_grid <- tidyr::crossing(mu_phi = mu_grid, psi_hp_grid)
+
+# M_HBRF1S,out hyperparameter grid search
+HBRF1S_out_grid <- HBRF1S_out_hp_grid %>%
+  rowwise() %>%
+  mutate(log_evidence = log_evidence_HBRF1S(mu_factor = mu_phi, 
+                                            alpha = alpha_psi, beta = beta_psi,
+                                            degree = d_obs, max_degree = J)) %>%
+  ungroup() %>%
+  arrange(desc(log_evidence))
+
+# Select hyperparameters with highest model evidence
+best_HBRF1S_out <- HBRF1S_out_grid %>%
+  slice(1)
+
+# Fit HBRF1S out-degree using optimized hyperparameters
+stan_HBRF1S_out_data <- list(K = K, J = J, D = D,
+                             mu_phi = best_HBRF1S_out$mu_phi[[1]],
+                             alpha_psi = best_HBRF1S_out$alpha_psi[[1]],
+                             beta_psi = best_HBRF1S_out$beta_psi[[1]])
+
+fit_HBRF1S_out <- sampling(stan_HBRF1S_out, data = stan_HBRF1S_out_data,
+                           iter = 10000, warmup = 2000, chains = 3, seed = 123, cores = 1)
+
+bridge_HBRF1S_out <- bridge_sampler(fit_HBRF1S_out, silent = TRUE)
+logml_HBRF1S_out <- bridge_HBRF1S_out$logml
+
+# MCMC convergence
+summary(fit_HBRF1S_out)$summary[, c("n_eff", "Rhat")]
+```
+
+```{r}
+# Model comparison
+# log p(D | M)
+logml <- c(
+  M_BB_in = opt_BB_in$log_evidence[[1]],
+  M_GU_in = opt_GU_in$log_evidence[[1]],
+  M_GT_in = bridge_GT_in$logml,
+  M_SZ_in = bridge_SZ_in$logml,
+
+  M_BB_out = opt_BB_out$log_evidence[[1]],
+  M_GU_out = opt_GU_out$log_evidence[[1]],
+  M_GT_out = bridge_GT_out$logml,
+  M_SZ_out = bridge_SZ_out$logml,
+
+  M_HBI = opt_HBI$log_evidence[[1]],
+  M_HBG = opt_HBG$log_evidence[[1]],
+
+  M_HBRF1S_in = best_HBRF1S_in$log_evidence[[1]],
+  M_HBRF1S_out = bridge_HBRF1S_out$logml
+)
+
+# log p(M) with same prior probability
+log_prior <- log(rep(1 / length(logml), length(logml)))
+names(log_prior) <- names(logml)
+
+# log (p(D ∣ M)p(M))
+log_bayes_numerator <- logml + log_prior
+
+# log p(D)
+log_bayes_denominator <- max(log_bayes_numerator) + log(sum(exp(log_bayes_numerator - max(log_bayes_numerator))))
+
+# p(M | D)
+posterior_model_probability <- exp(log_bayes_numerator - log_bayes_denominator)
+
+# Comparison table
+model_comparison <- tibble(
+
+  model = names(logml),
+
+  data_used = c(
+    rep("D via c_j", 4),
+    rep("D via d_k", 4),
+    rep("D", 2),
+    "D via c_j",
+    "D via d_k"
+  ),
+
+  model_family = c(
+    "M_BB,in: Beta-Binomial",
+    "M_GU,in: Untruncated geometric",
+    "M_GT,in: Truncated geometric",
+    "M_SZ,in: Shifted Zipf",
+
+    "M_BB,out: Beta-Binomial",
+    "M_GU,out: Untruncated geometric",
+    "M_GT,out: Truncated geometric",
+    "M_SZ,out: Shifted Zipf",
+
+    "M_HBI: Independent heterogeneous Bernoulli",
+    "M_HBG: Global heterogeneous Bernoulli",
+
+    "M_HBRF1S,in: Rank-1 factorized heterogeneous Bernoulli",
+    "M_HBRF1S,out: Rank-1 factorized heterogeneous Bernoulli"
+  ),
+
+  log_marginal_likelihood = as.numeric(logml),
+  prior_model_probability = exp(log_prior),
+  posterior_model_probability = as.numeric(posterior_model_probability)) %>%
+  arrange(desc(posterior_model_probability))
+
+model_comparison
+```
+
+```{r}
+# Posterior predictive checks 
+set.seed(123)
+ppc_degree_sample <- 1000
+
+# Plotting function
+plot_ppc_degree <- function(obs_degree, sim_degree, model_name, degree_type, 
+                            max_degree, bins = 30) {
+
+  # Stack posterior predictive degrees across PPC samples
+  stacked_sim_degree <- as.vector(sim_degree)
+
+  # Perturbation out-degree d_k
+  if (degree_type == "Perturbation out-degree d_k") {
+
+    # Common bins over the complete possible degree range
+    plot_max_degree <- max(max_degree, obs_degree, stacked_sim_degree, na.rm = TRUE)
+    breaks <- seq(-0.5, plot_max_degree + 0.5, length.out = bins + 1)
+
+    # Observed histogram
+    obs_hist <- hist(obs_degree, breaks = breaks, plot = FALSE, include.lowest = TRUE)
+
+    # Posterior predictive histogram
+    sim_hist <- hist(stacked_sim_degree, breaks = breaks, plot = FALSE, include.lowest = TRUE)
+
+    # Convert counts to probabilities
+    plot_df <- bind_rows(
+      tibble(bin_mid = obs_hist$mids, prob = obs_hist$counts / sum(obs_hist$counts),
+             source = "Observed"),
+      tibble(bin_mid = sim_hist$mids, prob = sim_hist$counts / sum(sim_hist$counts),
+             source = "Posterior predictive"))
+
+    ggplot(plot_df, aes(x = bin_mid, y = prob, fill = source)) +
+      geom_col(position = "identity", alpha = 0.45, width = diff(breaks)[1]) +
+      labs(title = paste0(model_name, ", FDR = ", fdr_label),
+           x = "Degree", y = "Probability", fill = NULL) +
+      theme_classic()
+
+  } else {
+
+    # Target in-degree c_j
+    plot_df <- bind_rows(
+      tibble(degree = obs_degree, source = "Observed"),
+      tibble(degree = stacked_sim_degree, source = "Posterior predictive")) %>%
+      count(source, degree, name = "freq") %>%
+      group_by(source) %>%
+      mutate(prob = freq / sum(freq)) %>%
+      ungroup()
+    
+    ggplot(plot_df, aes(x = degree, y = prob, fill = source)) +
+      geom_col(position = "identity", alpha = 0.45, width = 1) +
+      labs(title = paste0(model_name, ", FDR = ", fdr_label),
+           x = "Degree", y = "Probability", fill = NULL) +
+      theme_classic()
+  }
+}
+
+# M_BB,in: analytical posterior
+alpha_BB_in <- opt_BB_in$alpha[[1]]
+beta_BB_in  <- opt_BB_in$beta[[1]]
+
+sim_BB_infit_c <- matrix(NA, nrow = ppc_degree_sample, ncol = J)
+sim_BB_infit_d <- matrix(NA, nrow = ppc_degree_sample, ncol = K)
+
+for (s in seq_len(ppc_degree_sample)) {
+
+  # Posterior phi_j from the in-degree fit
+  phi_s <- rbeta(J, shape1 = alpha_BB_in + c_obs, shape2 = beta_BB_in + K - c_obs)
+
+  # Full replicated K x J edge matrix with each column j has Bernoulli probability phi_j
+  D_s <- matrix(rbinom(K * J, size = 1, prob = rep(phi_s, each = K)), nrow = K, ncol = J)
+
+  sim_BB_infit_c[s, ] <- colSums(D_s)
+  sim_BB_infit_d[s, ] <- rowSums(D_s)
+}
+
+qdraw(plot_ppc_degree(obs_degree = c_obs, sim_degree = sim_BB_infit_c,
+                      model_name = "M_BB,in(in)",
+                      degree_type = "Target in-degree c_j", max_degree = K))
+
+qdraw(plot_ppc_degree(obs_degree = d_obs, sim_degree = sim_BB_infit_d,
+                      model_name = "M_BB,in(out)",
+                      degree_type = "Perturbation out-degree d_k", max_degree = J))
+
+# M_BB,out: analytical posterior
+alpha_BB_out <- opt_BB_out$alpha[[1]]
+beta_BB_out  <- opt_BB_out$beta[[1]]
+
+sim_BB_outfit_c <- matrix(NA, nrow = ppc_degree_sample, ncol = J)
+sim_BB_outfit_d <- matrix(NA, nrow = ppc_degree_sample, ncol = K)
+
+for (s in seq_len(ppc_degree_sample)) {
+
+  # Posterior psi_k from out-degree fit
+  psi_s <- rbeta(K, shape1 = alpha_BB_out + d_obs, shape2 = beta_BB_out + J - d_obs)
+
+  # Full replicated edge matrix with each row k has Bernoulli probability psi_k
+  D_s <- matrix(rbinom(K * J, size = 1, prob = rep(psi_s, times = J)), nrow = K, ncol = J)
+
+  sim_BB_outfit_c[s, ] <- colSums(D_s)
+  sim_BB_outfit_d[s, ] <- rowSums(D_s)
+}
+
+qdraw(plot_ppc_degree(obs_degree = c_obs, sim_degree = sim_BB_outfit_c,
+                      model_name = "M_BB,out(in)",
+                      degree_type = "Target in-degree c_j", max_degree = K))
+
+qdraw(plot_ppc_degree(obs_degree = d_obs, sim_degree = sim_BB_outfit_d,
+                      model_name = "M_BB,out(out)",
+                      degree_type = "Perturbation out-degree d_k", max_degree = J))
+
+# M_GU,in: analytical posterior
+alpha_GU_in <- opt_GU_in$alpha[[1]]
+beta_GU_in  <- opt_GU_in$beta[[1]]
+
+sim_GU_in <- matrix(NA, nrow = ppc_degree_sample, ncol = J)
+sim_GU_infit_d <- matrix(NA, nrow = ppc_degree_sample, ncol = K)
+
+# Track how often exceeding happens
+GU_in_exceed <- 0
+
+for (s in seq_len(ppc_degree_sample)) {
+
+  # lambda | D
+  lambda_s <- rbeta(1, shape1 = alpha_GU_in + J, shape2 = beta_GU_in + S_obs)
+
+  # Untruncated geometric, resample degrees exceeding K
+  c_rep <- rgeom(J, prob = lambda_s)
+  
+  while (any(c_rep > K)) {
+    idx_bad <- which(c_rep > K)
+    GU_in_exceed <- GU_in_exceed + length(idx_bad)
+    c_rep[idx_bad] <- rgeom(length(idx_bad), prob = lambda_s)
+  }
+
+  sim_GU_in[s, ] <- c_rep
+
+  D_s <- matrix(0L, K, J)
+  for (j in seq_len(J)) {
+    if (c_rep[j] > 0) {
+      D_s[sample.int(K, c_rep[j]), j] <- 1L
+    }
+  }
+  sim_GU_infit_d[s, ] <- rowSums(D_s)
+  
+}
+
+GU_in_exceed
+
+qdraw(plot_ppc_degree(obs_degree = c_obs, sim_degree = sim_GU_in, 
+                      model_name = "M_GU,in(in)",
+                      degree_type = "Target in-degree c_j", max_degree = K))
+
+qdraw(plot_ppc_degree(obs_degree = d_obs, sim_degree = sim_GU_infit_d,
+                      model_name = "M_GU,in(out)",
+                      degree_type = "Perturbation out-degree d_k", max_degree = J))
+
+# M_GU,out: analytical posterior
+alpha_GU_out <- opt_GU_out$alpha[[1]]
+beta_GU_out  <- opt_GU_out$beta[[1]]
+
+sim_GU_out <- matrix(NA, nrow = ppc_degree_sample, ncol = K)
+sim_GU_outfit_c <- matrix(NA, nrow = ppc_degree_sample, ncol = J)
+
+# Track how often exceeding happens
+GU_out_exceed <- 0
+
+for (s in seq_len(ppc_degree_sample)) {
+
+  # lambda | D
+  lambda_s <- rbeta(1, shape1 = alpha_GU_out + K, shape2 = beta_GU_out + S_obs)
+
+  # Untruncated geometric, resample degrees exceeding J
+  d_rep <- rgeom(K, prob = lambda_s)
+  
+  while (any(d_rep > J)) {
+    idx_bad <- which(d_rep > J)
+    GU_out_exceed <- GU_out_exceed + length(idx_bad)
+    d_rep[idx_bad] <- rgeom(length(idx_bad), prob = lambda_s)
+  }
+
+  sim_GU_out[s, ] <- d_rep
+
+  D_s <- matrix(0L, K, J)
+  for (k in seq_len(K)) {
+    if (d_rep[k] > 0) {
+      D_s[k, sample.int(J, d_rep[k])] <- 1L
+    }
+  }
+  sim_GU_outfit_c[s, ] <- colSums(D_s)
+}
+
+GU_out_exceed
+
+qdraw(plot_ppc_degree(obs_degree = c_obs, sim_degree = sim_GU_outfit_c,
+                      model_name = "M_GU,out(in)",
+                      degree_type = "Target in-degree c_j", max_degree = K))
+
+qdraw(plot_ppc_degree(obs_degree = d_obs, sim_degree = sim_GU_out,
+                      model_name = "M_GU,out(out)",
+                      degree_type = "Perturbation out-degree d_k", max_degree = J))
+
+# Construct D^rep from a vector of in-degrees
+make_D_from_in_degree <- function(c_rep, K, J) {
+
+  D_s <- matrix(0L, K, J)
+
+  for (j in seq_len(J)) {
+    
+    if (c_rep[j] > 0) {
+      
+      D_s[sample.int(K, c_rep[j]), j] <- 1L
+      
+    }
+  }
+
+  D_s
+}
+
+# Construct D^rep from a vector of out-degrees
+make_D_from_out_degree <- function(d_rep, K, J) {
+
+  D_s <- matrix(0L, K, J)
+
+  for (k in seq_len(K)) {
+
+    if (d_rep[k] > 0) {
+
+      D_s[k, sample.int(J, d_rep[k])] <- 1L
+      
+    }
+  }
+
+  D_s
+}
+
+# M_GT,in: stan posterior draws
+lambda_GT_in <- rstan::extract(fit_GT_in, pars = "lambda", permuted = TRUE)$lambda
+idx <- sample(seq_along(lambda_GT_in), ppc_degree_sample)
+
+sim_GT_infit_c <- matrix(NA, nrow = ppc_degree_sample, ncol = J)
+sim_GT_infit_d <- matrix(NA, nrow = ppc_degree_sample, ncol = K)
+
+degree_grid <- 0:K
+
+for (s in seq_len(ppc_degree_sample)) {
+
+  lambda_s <- lambda_GT_in[idx[s]]
+
+  # GT in-degree probabilities
+  log_prob_s <- degree_grid * log1p(-lambda_s)
+  log_prob_s <- log_prob_s - max(log_prob_s)
+  prob_s <- exp(log_prob_s)
+  prob_s <- prob_s / sum(prob_s)
+
+  # Draw replicated in-degrees
+  c_rep <- sample(degree_grid, size = J, replace = TRUE, prob = prob_s)
+
+  # Convert those degrees into D^rep
+  D_s <- make_D_from_in_degree(c_rep = c_rep, K = K, J = J)
+
+  sim_GT_infit_c[s, ] <- colSums(D_s)
+  sim_GT_infit_d[s, ] <- rowSums(D_s)
+}
+
+qdraw(plot_ppc_degree(obs_degree = c_obs, sim_degree = sim_GT_infit_c,
+                      model_name = "M_GT,in(in)",
+                      degree_type = "Target in-degree c_j", max_degree = K))
+
+qdraw(plot_ppc_degree(obs_degree = d_obs, sim_degree = sim_GT_infit_d,
+                      model_name = "M_GT,in(out)",
+                      degree_type = "Perturbation out-degree d_k", max_degree = J))
+
+# M_GT,out: stan posterior draws
+lambda_GT_out <- rstan::extract(fit_GT_out, pars = "lambda", permuted = TRUE)$lambda
+idx <- sample(seq_along(lambda_GT_out), ppc_degree_sample)
+
+sim_GT_outfit_c <- matrix(NA, nrow = ppc_degree_sample, ncol = J)
+sim_GT_outfit_d <- matrix(NA, nrow = ppc_degree_sample, ncol = K)
+
+degree_grid <- 0:J
+
+for (s in seq_len(ppc_degree_sample)) {
+
+  lambda_s <- lambda_GT_out[idx[s]]
+
+  # GT out-degree probabilities
+  log_prob_s <- degree_grid * log1p(-lambda_s)
+  log_prob_s <- log_prob_s - max(log_prob_s)
+  prob_s <- exp(log_prob_s)
+  prob_s <- prob_s / sum(prob_s)
+
+  # Draw replicated out-degrees
+  d_rep <- sample(degree_grid, size = K, replace = TRUE, prob = prob_s)
+
+  # Convert those degrees into D^rep
+  D_s <- make_D_from_out_degree(d_rep = d_rep, K = K, J = J)
+
+  sim_GT_outfit_c[s, ] <- colSums(D_s)
+  sim_GT_outfit_d[s, ] <- rowSums(D_s)
+}
+
+qdraw(plot_ppc_degree(obs_degree = c_obs, sim_degree = sim_GT_outfit_c,
+                      model_name = "M_GT,out(in)",
+                      degree_type = "Target in-degree c_j", max_degree = K))
+
+qdraw(plot_ppc_degree(obs_degree = d_obs, sim_degree = sim_GT_outfit_d,
+                      model_name = "M_GT,out(out)",
+                      degree_type = "Perturbation out-degree d_k", max_degree = J))
+
+# M_SZ,in: stan posterior draws
+s_SZ_in <- rstan::extract(fit_SZ_in, pars = "s", permuted = TRUE)$s
+idx <- sample(seq_along(s_SZ_in), ppc_degree_sample)
+
+sim_SZ_infit_c <- matrix(NA, nrow = ppc_degree_sample, ncol = J)
+sim_SZ_infit_d <- matrix(NA, nrow = ppc_degree_sample, ncol = K)
+
+degree_grid <- 0:K
+
+for (s in seq_len(ppc_degree_sample)) {
+
+  s_par <- s_SZ_in[idx[s]]
+
+  # SZ in-degree probabilities
+  log_prob_s <- -s_par * log(degree_grid + 1)
+  log_prob_s <- log_prob_s - max(log_prob_s)
+  prob_s <- exp(log_prob_s)
+  prob_s <- prob_s / sum(prob_s)
+
+  # Draw replicated in-degrees
+  c_rep <- sample(degree_grid, size = J, replace = TRUE, prob = prob_s)
+
+  # Convert those degrees into D^rep
+  D_s <- make_D_from_in_degree(c_rep, K, J)
+
+  sim_SZ_infit_c[s, ] <- colSums(D_s)
+  sim_SZ_infit_d[s, ] <- rowSums(D_s)
+}
+
+qdraw(plot_ppc_degree(obs_degree = c_obs, sim_degree = sim_SZ_infit_c,
+                      model_name = "M_SZ,in(in)",
+                      degree_type = "Target in-degree c_j", max_degree = K))
+
+qdraw(plot_ppc_degree(obs_degree = d_obs, sim_degree = sim_SZ_infit_d,
+                      model_name = "M_SZ,in(out)",
+                      degree_type = "Perturbation out-degree d_k", max_degree = J))
+
+# M_SZ,out: stan posterior draws
+s_SZ_out <- rstan::extract(fit_SZ_out, pars = "s", permuted = TRUE)$s
+idx <- sample(seq_along(s_SZ_out), ppc_degree_sample)
+
+sim_SZ_outfit_c <- matrix(NA, nrow = ppc_degree_sample, ncol = J)
+sim_SZ_outfit_d <- matrix(NA, nrow = ppc_degree_sample, ncol = K)
+
+degree_grid <- 0:J
+
+for (s in seq_len(ppc_degree_sample)) {
+
+  s_par <- s_SZ_out[idx[s]]
+
+  # SZ out-degree probabilities
+  log_prob_s <- -s_par * log(degree_grid + 1)
+  log_prob_s <- log_prob_s - max(log_prob_s)
+  prob_s <- exp(log_prob_s)
+  prob_s <- prob_s / sum(prob_s)
+
+  # Draw replicated out-degrees
+  d_rep <- sample(degree_grid, size = K, replace = TRUE, prob = prob_s)
+
+  # Convert those degrees into D^rep
+  D_s <- make_D_from_out_degree(d_rep, K, J)
+
+  sim_SZ_outfit_c[s, ] <- colSums(D_s)
+  sim_SZ_outfit_d[s, ] <- rowSums(D_s)
+}
+
+qdraw(plot_ppc_degree(obs_degree = c_obs, sim_degree = sim_SZ_outfit_c,
+                      model_name = "M_SZ,out(in)",
+                      degree_type = "Target in-degree c_j", max_degree = K))
+
+qdraw(plot_ppc_degree(obs_degree = d_obs, sim_degree = sim_SZ_outfit_d,
+                      model_name = "M_SZ,out(out)",
+                      degree_type = "Perturbation out-degree d_k", max_degree = J))
+
+# M_HBI: direct posterior predictive distribution
+ppc_edge_sample <- 1000
+mu_HBI <- opt_HBI$mu[[1]]
+
+sim_HBI_c <- matrix(NA, nrow = ppc_edge_sample, ncol = J)
+sim_HBI_d <- matrix(NA, nrow = ppc_edge_sample, ncol = K)
+
+for (s in seq_len(ppc_edge_sample)) {
+
+  # Replicated binary edge matrix
+  D_s <- matrix(rbinom(K * J, size = 1, prob = mu_HBI), nrow = K, ncol = J)
+
+  # Target in-degree
+  sim_HBI_c[s, ] <- colSums(D_s)
+
+  # Perturbation out-degree
+  sim_HBI_d[s, ] <- rowSums(D_s)
+}
+
+qdraw(plot_ppc_degree(obs_degree = c_obs, sim_degree = sim_HBI_c,
+                      model_name = "M_HBI(in)",
+                      degree_type = "Target in-degree c_j", max_degree = K))
+
+qdraw(plot_ppc_degree(obs_degree = d_obs, sim_degree = sim_HBI_d,
+                      model_name = "M_HBI(out)",
+                      degree_type = "Perturbation out-degree d_k", max_degree = J))
+
+# M_HBG: analytical posterior
+alpha_HBG <- opt_HBG$alpha[[1]]
+beta_HBG  <- opt_HBG$beta[[1]]
+
+sim_HBG_c <- matrix(NA, nrow = ppc_edge_sample, ncol = J)
+sim_HBG_d <- matrix(NA, nrow = ppc_edge_sample, ncol = K)
+
+for (s in seq_len(ppc_edge_sample)) {
+
+  # Draw global pi from analytical posterior
+  pi_s <- rbeta(1, shape1 = alpha_HBG + S_obs, shape2 = beta_HBG + K * J - S_obs)
+
+  # Replicated edge matrix
+  D_s <- matrix(rbinom(K * J, size = 1, prob = pi_s), nrow = K, ncol = J)
+
+  # Target in-degree
+  sim_HBG_c[s, ] <- colSums(D_s)
+
+  # Perturbation out-degree
+  sim_HBG_d[s, ] <- rowSums(D_s)
+}
+
+qdraw(plot_ppc_degree(obs_degree = c_obs, sim_degree = sim_HBG_c, 
+                      model_name = "M_HBG(in)",
+                      degree_type = "Target in-degree c_j", max_degree = K))
+
+# Perturbation out-degree
+qdraw(plot_ppc_degree(obs_degree = d_obs, sim_degree = sim_HBG_d,
+                      model_name = "M_HBG(out)",
+                      degree_type = "Perturbation out-degree d_k", max_degree = J))
+
+# M_HBRF1S,in: stan posterior draws
+mu_psi_HBRF1S <- best_HBRF1S_in$mu_psi[[1]]
+phi_draws <- rstan::extract(fit_HBRF1S_in, pars = "phi", permuted = TRUE)$phi
+idx <- sample(seq_len(nrow(phi_draws)), ppc_degree_sample)
+
+sim_HBRF1S_in <- matrix(NA, nrow = length(idx), ncol = J)
+
+for (s in seq_along(idx)) {
+
+  # Entire posterior phi vector from one Stan iteration
+  phi_s <- phi_draws[idx[s],]
+
+  # Replicated target in-degrees
+  sim_HBRF1S_in[s, ] <- rbinom(J, size = K, prob = mu_psi_HBRF1S * phi_s)
+}
+
+qdraw(plot_ppc_degree(obs_degree = c_obs, sim_degree = sim_HBRF1S_in,
+                      model_name = "M_HBRF1S(in)",
+                      degree_type = "Target in-degree c_j", max_degree = K))
+
+# M_HBRF1S,out: stan posterior draws
+mu_phi_HBRF1S <- best_HBRF1S_out$mu_phi[[1]]
+psi_draws <- rstan::extract(fit_HBRF1S_out, pars = "psi", permuted = TRUE)$psi
+idx <- sample(seq_len(nrow(psi_draws)), ppc_degree_sample)
+
+sim_HBRF1S_out <- matrix(NA, nrow = length(idx), ncol = K)
+
+for (s in seq_along(idx)) {
+
+  # Entire posterior psi vector from one Stan iteration
+  psi_s <- psi_draws[idx[s],]
+
+  # Replicated perturbation out-degrees
+  sim_HBRF1S_out[s, ] <- rbinom(K, size = J, prob = mu_phi_HBRF1S * psi_s)
+}
+
+qdraw(plot_ppc_degree(obs_degree = d_obs, sim_degree = sim_HBRF1S_out,
+                      model_name = "M_HBRF1S(out)",
+                      degree_type = "Perturbation out-degree d_k", max_degree = J))
+```
